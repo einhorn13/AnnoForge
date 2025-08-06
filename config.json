@@ -1,0 +1,4 @@
+{
+  "last_model": "ckpt\\Florence-2-large-PromptGen-v2.0",
+  "default_prompt_type": "Caption"
+}
