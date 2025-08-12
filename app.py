@@ -1,415 +1,250 @@
 # app.py
 import os
-import tkinter as tk
-from tkinter import ttk
-from tkinter import messagebox, simpledialog, filedialog
-from PIL import Image, ImageTk
-import threading
-from ui import AppUI
-from model_manager import load_model, generate_caption
+import shlex
+from tkinter import messagebox, filedialog
+import logging
+import customtkinter as ctk
+
+from events import EventBus
+from app_state import AppState
+from app_context import AppContext
+from plugin_manager import PluginManager
+from providers import ImageFileProvider
+from task_queue import TaskQueue, Task
+from annotation_manager import AnnotationManager
+from project_manager import ProjectManager
+from ui.main_window import AppUI
 import utils
 
-PROMPT_TYPES = [
-    "Caption", "Detailed Caption", "More Detailed",
-    "Tags (General)", "Tags (Objects)", "Tags (Style)", "Tags (Composition)",
-    "Prompt (SD)", "Prompt (V2)"
-]
-
-PROMPT_DESCRIPTIONS = {
-    "Caption": "Short, simple description of the image content",
-    "Detailed Caption": "More detailed description with main elements",
-    "More Detailed": "Comprehensive description including small details",
-    "Tags (General)": "General tags describing content, objects, style",
-    "Tags (Objects)": "Tags focused on objects present in the image",
-    "Tags (Style)": "Tags describing artistic style, mood, composition",
-    "Tags (Composition)": "Tags focused on composition, perspective, lighting",
-    "Prompt (SD)": "Prompt format optimized for Stable Diffusion",
-    "Prompt (V2)": "Enhanced prompt format with detailed elements"
-}
-
-PROMPT_MAP = {
-    "Caption": "<CAPTION>",
-    "Detailed Caption": "<DETAILED_CAPTION>",
-    "More Detailed": "<MORE_DETAILED_CAPTION>",
-    "Tags (General)": "<GENERATE_TAGS>",
-    "Tags (Objects)": "<GENERATE_TAGS_OBJECT>",
-    "Tags (Style)": "<GENERATE_TAGS_STYLE>",
-    "Tags (Composition)": "<GENERATE_TAGS_COMPOSITION>",
-    "Prompt (SD)": "<GENERATE_PROMPT>",
-    "Prompt (V2)": "<GENERATE_PROMPT_V2>",
-}
-
-class ToolTip:
-    def __init__(self, widget):
-        self.widget = widget
-        self.tip_window = None
-
-    def showtip(self, text):
-        if self.tip_window or not text:
-            return
-        x, y, cx, cy = self.widget.bbox("insert")
-        x = x + self.widget.winfo_rootx() + 20
-        y = y + cy + self.widget.winfo_rooty() + 20
-        self.tip_window = tw = tk.Toplevel(self.widget)
-        tw.wm_overrideredirect(True)
-        tw.wm_geometry(f"+{x}+{y}")
-        label = tk.Label(tw, text=text, justify=tk.LEFT,
-                         background="#ffffe0", relief=tk.SOLID, borderwidth=1,
-                         font=("tahoma", "8", "normal"), wraplength=300)
-        label.pack(ipadx=1)
-
-    def hidetip(self):
-        if self.tip_window:
-            self.tip_window.destroy()
-        self.tip_window = None
-
 class AutoCaptionerApp:
-    def __init__(self, root):
+    def __init__(self, root: ctk.CTk):
         self.root = root
-        self.selected_files = {}
-        self.generating = False
-        self.abort_flag = False
+        self.search_debounce_job = None
+        
+        # --- Core Architecture ---
+        self.event_bus = EventBus()
+        self.app_state = AppState(self.event_bus)
+        
+        # --- Managers and Services ---
+        self.plugin_manager = PluginManager()
+        self.task_queue = TaskQueue(self.event_bus)
+        self.annotation_manager = AnnotationManager()
+        self.project_manager = ProjectManager(self.event_bus)
+        
+        self.data_provider = None
+        self.active_model_plugin = None
+        self.default_prompt_type = "Detailed Caption"
+        
+        # --- REFACTORED: Initialization order is critical. ---
+        
+        # 1. Create UI shell
+        self.ui = AppUI(root, self.event_bus)
+        
+        # 2. Discover plugins to have them ready for context
+        self.plugin_manager.discover_plugins()
+        self.app_state.all_plugins = self.plugin_manager.get_all_plugin_instances()
+        
+        # 3. Create the AppContext
+        self.app_context = self._create_app_context()
+        
+        # 4. Inject context into ALL components BEFORE initializing their UI
+        self._inject_context_into_services()
+        
+        # 5. Now that all components are context-aware, initialize plugin UI
+        self.ui.initialize_plugins(self.plugin_manager.image_processors, self.plugin_manager.batch_operations)
 
+        # 6. Final setup
+        self._register_event_listeners()
+        self.active_model_plugin = self._get_active_model_plugin()
+
+        if self.active_model_plugin:
+            self.ui.set_prompt_types(list(self.active_model_plugin.get_supported_prompts().keys()))
+            self.ui.populate_model_dropdown(
+                [os.path.basename(p) for p in self.active_model_plugin.get_model_paths()]
+            )
+        
+        self._load_last_project()
+
+    def _create_app_context(self) -> AppContext:
+        return AppContext(root=self.root, event_bus=self.event_bus, app_state=self.app_state,
+                          data_provider=self.data_provider, task_queue=self.task_queue,
+                          plugin_manager=self.plugin_manager, annotation_manager=self.annotation_manager, 
+                          project_manager=self.project_manager, ui=self.ui)
+        
+    def _inject_context_into_services(self):
+        """Injects the app context into all services that need it."""
+        self.task_queue.app_context = self.app_context
+        self.ui.app_context = self.app_context
+        self.ui.thumbnail_list.app_context = self.app_context
+        for plugin in self.plugin_manager.get_all_plugin_instances():
+            plugin.app_context = self.app_context
+
+    def _get_active_model_plugin(self):
+        if not self.plugin_manager.model_assistants:
+            messagebox.showerror("Fatal Error", "No Model Assistant plugin found."); self.root.destroy(); return None
+        return self.plugin_manager.model_assistants[0]
+
+    def _register_event_listeners(self):
+        bus = self.event_bus
+        bus.subscribe("ui:new_project_clicked", self.on_new_project)
+        bus.subscribe("ui:open_project_clicked", self.on_open_project)
+        bus.subscribe("project:loaded", self.on_project_loaded)
+        bus.subscribe("state:active_item_changed", self.on_active_item_changed)
+        bus.subscribe("appstate:set_checked_ids", lambda ids: setattr(self.app_state, 'checked_ids', ids))
+        bus.subscribe("appstate:set_active_id", lambda id: setattr(self.app_state, 'active_id', id))
+        bus.subscribe("ui:plugin_state_changed", self.on_plugin_state_changed)
+        bus.subscribe("ui:batch_apply_plugin_state", self.on_batch_apply_plugin_state)
+        bus.subscribe("ui:generate_clicked", self.start_captioning)
+        bus.subscribe("ui:queue_run", self.task_queue.start); bus.subscribe("ui:queue_pause", self.task_queue.pause)
+        bus.subscribe("ui:queue_resume", self.task_queue.resume); bus.subscribe("ui:queue_stop", self.task_queue.stop)
+        bus.subscribe("ui:search_options_changed", self._on_search_options_changed)
+        bus.subscribe("ui:batch_prompt_apply", self._apply_prompt_type_to_checked)
+        bus.subscribe("ui:model_selected", self.load_model)
+        bus.subscribe("ui:caption_edited", self.save_caption)
+        bus.subscribe("ui:prompt_type_changed", lambda item_id, pt: self.data_provider.update_prompt_type(item_id, pt))
+        bus.subscribe("data:caption_saved", lambda item_id: self.ui.thumbnail_list.update_item_caption(item_id))
+        
+        self.root.drop_target_register('DND_FILES')
+        self.root.dnd_bind('<<Drop>>', self.on_drop)
+
+    def on_new_project(self, image_dir=None):
+        if not image_dir:
+            image_dir = filedialog.askdirectory(title="Select folder with source images")
+        if not image_dir: return
+        
+        project_dir = filedialog.askdirectory(title="Select folder to save the new project")
+        if not project_dir: return
+        
+        dialog = ctk.CTkInputDialog(text="Enter project name:", title="New Project")
+        name = dialog.get_input()
+        if name:
+            if not self.project_manager.create_project(name, project_dir, image_dir):
+                self.app_context.show_error("Creation Failed", "Project directory might already exist or another error occurred.")
+
+    def on_open_project(self):
+        project_path = filedialog.askdirectory(title="Select Project Folder")
+        if project_path: self.project_manager.load_project(project_path)
+            
+    def on_project_loaded(self, config: dict):
+        self.root.title(f"AnnoForge - [{config['name']}]")
+        self.annotation_manager.connect(config['db_path'])
+        
+        config_from_file = utils.load_config()
+        self.default_prompt_type = config_from_file.get("default_prompt_type", "Detailed Caption")
+        self.data_provider = ImageFileProvider(self.default_prompt_type)
+        self.app_context.data_provider = self.data_provider
+        
+        files = self.data_provider.scan(config['data_source'])
+        self.app_state.all_files = files
+
+        if files:
+            first_item_id = files[0]['item_id']
+            self.app_state.active_id = first_item_id
+            self.app_state.checked_ids = [first_item_id]
+        else:
+            self.app_state.active_id = None
+            self.app_state.checked_ids = []
+            
+        last_model_path = config_from_file.get("last_model")
+        if last_model_path and os.path.exists(last_model_path):
+            if not (self.active_model_plugin and self.active_model_plugin.is_model_loaded(last_model_path)):
+                self.load_model(last_model_path)
+        else:
+            logging.warning("Last used model not found or specified.")
+            
+        if self.project_manager.current_project_path:
+            utils.save_config({"last_project_path": self.project_manager.current_project_path})
+
+    def _load_last_project(self):
         config = utils.load_config()
-        self.last_model = config.get("last_model")
-        self.default_prompt_type = config.get("default_prompt_type", "Detailed Caption")
-        if self.default_prompt_type not in PROMPT_TYPES:
-            self.default_prompt_type = "Detailed Caption"
+        last_project = config.get("last_project_path")
+        if last_project and os.path.exists(last_project):
+            logging.info(f"Attempting to load last opened project: {last_project}")
+            self.project_manager.load_project(last_project)
 
-        # --- Callbacks ---
-        callbacks = {
-            "on_refresh": self.load_files,
-            "on_generate": self.start_captioning,
-            "on_abort": self.abort,
-            "on_export": self.export_csv,
-            "on_replace": self.open_replace_dialog,
-            "on_bulk_change_prompt": self.bulk_change_prompt,
-            "on_click": self.on_click,
-            "on_edit": self.on_edit,
-            "on_selection": self.on_selection,
-            "on_context_menu": self.show_context_menu,
-            "on_edit_prompt_type": self.on_edit_prompt_type,
-            "on_model_selected": lambda e: self.load_model(),
-        }
+    def on_active_item_changed(self, active_id: str | None):
+        if not active_id: return
+        for plugin in self.plugin_manager.image_processors:
+            if hasattr(plugin, 'on_state_load'):
+                data = self.annotation_manager.get_data(active_id, plugin.name)
+                plugin.on_state_load(data)
+    
+    def on_plugin_state_changed(self, plugin_name: str):
+        active_id = self.app_state.active_id
+        if not active_id: return
+        plugin_instance = next((p for p in self.plugin_manager.image_processors if p.name == plugin_name), None)
+        if plugin_instance and hasattr(plugin_instance, 'get_state_to_save') and (state_to_save := plugin_instance.get_state_to_save()) is not None:
+            self.annotation_manager.save_data(active_id, plugin_name, state_to_save)
 
-        # --- UI ---
-        self.ui = AppUI(root, callbacks)
+    def on_batch_apply_plugin_state(self, plugin_name: str, item_ids: list[str], data: dict):
+        def task(item_id, context):
+            context.annotation_manager.save_data(item_id, plugin_name, data)
+            return True
+        task_obj = Task(name=f"Apply {plugin_name} state", target=task, items=item_ids)
+        self.task_queue.add_task(task_obj)
+        self.app_context.show_info("Task Added", f"Added task to apply '{plugin_name}' settings to {len(item_ids)} items.")
 
-        # --- Assign UI elements ---
-        self.tree = self.ui.tree
-        self.status_var = self.ui.status_var
-        self.progress_var = self.ui.progress_var
-        self.model_dropdown = self.ui.model_dropdown
-        self.preview_label = self.ui.preview_label
-        self.context_menu = self.ui.context_menu
+    def load_model(self, model_path: str):
+        if not model_path or "No models" in model_path: return
+        task = Task(name=f"Load Model: {os.path.basename(model_path)}", target=self._load_model_task, args=(model_path,))
+        self.task_queue.add_task(task)
 
-        # --- Tooltip ---
-        self.tooltip = ToolTip(self.tree)
-
-        # --- Load data ---
-        self.load_files()
-        self.model_paths = utils.scan_checkpoints()
-        self.ui.populate_model_dropdown(self.model_paths)
-
-        # --- Restore last model ---
-        if self.last_model and self.last_model in self.model_paths:
-            try:
-                idx = self.model_paths.index(self.last_model)
-                if idx < len(self.model_dropdown["values"]):
-                    self.model_dropdown.current(idx)
-                    self.load_model()
-            except ValueError:
-                pass
-
-    def load_model(self):
-        idx = self.model_dropdown.current()
-        if idx < 0 or idx >= len(self.model_paths):
-            return
-        model_path = self.model_paths[idx]
-        self.status_var.set(f"Loading {os.path.basename(model_path)}...")
-        threading.Thread(target=self._load_in_bg, args=(model_path,), daemon=True).start()
-
-    def _load_in_bg(self, model_path):
-        success, msg = load_model(model_path)
-        self.root.after(0, lambda: self.status_var.set(msg))
+    def _load_model_task(self, context, model_path):
+        model_name = os.path.basename(model_path)
+        context.event_bus.publish("ui:set_enabled", False); context.event_bus.publish("state:status_changed", f"Loading {model_name}...")
+        success, msg = self.active_model_plugin.load_model(model_path)
         if success:
-            self.last_model = model_path
-            utils.save_config({
-                "last_model": model_path,
-                "default_prompt_type": self.default_prompt_type
-            })
-
-    def load_files(self):
-        for item in self.tree.get_children():
-            self.tree.delete(item)
-        self.selected_files.clear()
-
-        files = utils.scan_images()
-        for f in files:
-            path = os.path.join("captions", f)
-            txt_path = f"{os.path.splitext(path)[0]}.txt"
-            status = "✅" if os.path.exists(txt_path) else "❌"
-            item_id = self.tree.insert("", "end", values=(f, self.default_prompt_type, status))
-            self.selected_files[item_id] = {
-                "item_id": item_id,
-                "filename": f,
-                "filepath": path,
-                "txt_path": txt_path,
-                "prompt_type": self.default_prompt_type
-            }
-        self.on_selection()
-
-    def on_click(self, event):
-        """Handle click - no checkbox logic anymore"""
-        pass  # Selection handled by Treeview's built-in selection
-
-    def on_selection(self, event=None):
-        """Update preview and status when file is selected"""
-        selected = self.tree.selection()
-        if not selected:
-            self.clear_preview()
-            self.status_var.set("Ready")
-            return
-
-        item_id = selected[0]
-        data = self.selected_files.get(item_id)
-        if not data or not os.path.exists(data["filepath"]):
-            self.clear_preview()
-            return
-
-        try:
-            img = Image.open(data["filepath"])
-            img.thumbnail((240, 240))
-            photo = ImageTk.PhotoImage(img)
-            self.preview_label.configure(image=photo)
-            self.preview_label.image = photo
-            self.status_var.set(f"Selected: {data['filename']} | Type: {data['prompt_type']}")
-        except Exception as e:
-            print(f"Preview error: {e}")
-            self.clear_preview()
-
-    def clear_preview(self):
-        self.preview_label.configure(image=None)
-        self.preview_label.image = None
-
-    def show_context_menu(self, event):
-        if len(self.tree.selection()) > 1:
-            self.context_menu.tk_popup(event.x_root, event.y_root)
-
-    def bulk_change_prompt(self):
-        new_type = simpledialog.askstring("Prompt Type", f"Available: {', '.join(PROMPT_TYPES)}")
-        if new_type and new_type in PROMPT_TYPES:
-            for item_id in self.tree.selection():
-                data = self.selected_files.get(item_id)
-                if data is not None:
-                    data["prompt_type"] = new_type
-                    self.tree.set(item_id, "prompt_type", new_type)
-            self.default_prompt_type = new_type
-            utils.save_config({
-                "last_model": self.last_model,
-                "default_prompt_type": new_type
-            })
-            self.on_selection()  # Update status bar
-
-    def on_edit(self, event):
-        """Open editor only when clicking on filename (not on 'Type' column)"""
-        column = self.tree.identify_column(event.x)
-        if column == "#2":  # This is the 'Type' column now (after removing checkbox)
-            return
-        item_id = self.tree.identify_row(event.y)
-        data = self.selected_files.get(item_id)
-        if data is not None:
-            self.edit_caption(data["txt_path"], data["filepath"])
-
-    def on_edit_prompt_type(self, event):
-        """Inline edit prompt_type with tooltip description"""
-        column = self.tree.identify_column(event.x)
-        item_id = self.tree.identify_row(event.y)
-        if not item_id or column != "#2":  # Now column #2 is 'Type'
-            return
-
-        data = self.selected_files.get(item_id)
-        if data is None:
-            return
-
-        current = data["prompt_type"]
-        x, y, width, height = self.tree.bbox(item_id, column)
-
-        var = tk.StringVar(value=current)
-        combo = ttk.Combobox(self.tree, textvariable=var, values=PROMPT_TYPES, state="readonly", width=18)
-        combo.place(x=x, y=y, width=width, height=height)
-
-        # Tooltip
-        tooltip = ToolTip(combo)
-
-        def update_tooltip(_=None):
-            desc = PROMPT_DESCRIPTIONS.get(var.get(), "")
-            tooltip.showtip(desc)
-
-        combo.bind("<Enter>", update_tooltip)
-        combo.bind("<Motion>", update_tooltip)
-        combo.bind("<Leave>", lambda e: tooltip.hidetip())
-        combo.bind("<<ComboboxSelected>>", update_tooltip)
-
-        def save_edit(_=None):
-            if var.get() in PROMPT_TYPES:
-                data["prompt_type"] = var.get()
-                self.tree.set(item_id, "prompt_type", var.get())
-                self.default_prompt_type = var.get()
-                utils.save_config({
-                    "last_model": self.last_model,
-                    "default_prompt_type": var.get()
-                })
-                self.on_selection()  # Update status
-            combo.destroy()
-            tooltip.hidetip()
-
-        def cancel_edit(_=None):
-            combo.destroy()
-            tooltip.hidetip()
-
-        combo.bind("<Return>", save_edit)
-        combo.bind("<Escape>", cancel_edit)
-        combo.bind("<FocusOut>", cancel_edit)
-        combo.focus_set()
-        combo.selection_clear()
-
-    def edit_caption(self, txt_path, img_path):
-        win = tk.Toplevel(self.root)
-        win.title(f"Edit: {os.path.basename(txt_path)}")
-        win.geometry("600x400")
-        win.transient(self.root)
-        win.grab_set()
-
-        try:
-            img = Image.open(img_path)
-            img.thumbnail((100, 100))
-            photo = ImageTk.PhotoImage(img)
-            tk.Label(win, image=photo).pack(side=tk.LEFT, padx=10, pady=10)
-            win.image = photo
-        except Exception:
-            tk.Label(win, text="Image error").pack(side=tk.LEFT, padx=10)
-
-        text = tk.Text(win, wrap=tk.WORD, font=("Courier", 10))
-        if os.path.exists(txt_path):
-            with open(txt_path, "r", encoding="utf-8") as f:
-                text.insert("1.0", f.read())
-        text.pack(fill=tk.BOTH, expand=True, padx=10, pady=10)
-
-        def save():
-            try:
-                content = text.get("1.0", tk.END).strip()
-                with open(txt_path, "w", encoding="utf-8") as f:
-                    f.write(content)
-                self.root.after(0, lambda: self.tree.set(data["item_id"], "status", "✅"))
-                win.destroy()
-            except Exception as e:
-                messagebox.showerror("Error", f"Save failed: {e}")
-
-        btn = tk.Frame(win)
-        btn.pack(fill=tk.X, pady=5)
-        tk.Button(btn, text="Save", command=save).pack(side=tk.LEFT, padx=5)
-        tk.Button(btn, text="Close", command=win.destroy).pack(side=tk.RIGHT, padx=5)
+            utils.save_config({"last_model": model_path})
+            logging.info(f"Successfully loaded model: {model_name}"); context.ui.set_selected_model(model_path)
+        else:
+            logging.error(f"Failed to load model '{model_name}': {msg}"); context.show_error("Model Load Failed", f"Could not load '{model_name}'.\n\nReason: {msg}")
+        context.event_bus.publish("ui:set_enabled", True)
+        return success
 
     def start_captioning(self):
-        if self.generating:
-            return
-        selected_items = self.tree.selection()
-        if not selected_items:
-            messagebox.showwarning("Selection", "No files selected.")
-            return
-        self.generating = True
-        self.abort_flag = False
-        self.progress_var.set(0)
-        threading.Thread(target=self.process, args=(selected_items,), daemon=True).start()
+        checked_ids = self.app_state.checked_ids
+        if not checked_ids: messagebox.showwarning("Selection", "No images checked."); return
+        items = self.data_provider.get_files_by_ids(checked_ids)
+        task = Task(name="Generate Captions", target=self._captioning_task, items=items); self.task_queue.add_task(task)
+    
+    def _captioning_task(self, item_data, context):
+        prompt_type = item_data.get("prompt_type", self.default_prompt_type)
+        success, caption_or_error = self.active_model_plugin.run_inference(item_data["filepath"], prompt_type)
+        if success: self.save_caption(item_data["item_id"], caption_or_error)
+        else: logging.error(f"Inference failed for {item_data['filename']}: {caption_or_error}")
+        return success
+    
+    def save_caption(self, item_id: str, content: str):
+        if self.data_provider and self.data_provider.save_item_data(item_id, {"caption": content}):
+            self.event_bus.publish("data:caption_saved", item_id)
 
-    def abort(self):
-        if self.generating:
-            self.abort_flag = True
-            self.generating = False
-            self.status_var.set("Aborted")
+    def _on_search_options_changed(self, options: dict):
+        if self.search_debounce_job: self.root.after_cancel(self.search_debounce_job)
+        self.search_debounce_job = self.root.after(300, lambda: setattr(self.app_state, 'search_options', options))
 
-    def process(self, item_ids):
-        total = len(item_ids)
-        for i, item_id in enumerate(item_ids):
-            if self.abort_flag:
-                break
-            data = self.selected_files.get(item_id)
-            if not data:  # ✅ Исправленная строка
-                continue
-            success, caption = generate_caption(data["filepath"], data["prompt_type"], PROMPT_MAP)
-            if success:
-                try:
-                    with open(data["txt_path"], "w", encoding="utf-8") as f:
-                        f.write(caption)
-                    self.root.after(0, lambda item_id=item_id: self.tree.set(item_id, "status", "✅"))
-                except Exception as e:
-                    print(f"Write error {data['txt_path']}: {e}")
-                    self.root.after(0, lambda item_id=item_id: self.tree.set(item_id, "status", "❌"))
+    def _apply_prompt_type_to_checked(self, new_prompt_type: str):
+        checked_ids = self.app_state.checked_ids
+        if not checked_ids: messagebox.showwarning("Selection", "No items checked."); return
+        for item_id in checked_ids: self.data_provider.update_prompt_type(item_id, new_prompt_type)
+        self.event_bus.publish("ui:update_prompt_display", checked_ids, new_prompt_type)
+        logging.info(f"Set prompt type to '{new_prompt_type}' for {len(checked_ids)} items.")
+
+    def on_drop(self, event):
+        try:
+            paths = shlex.split(event.data)
+        except ValueError:
+            paths = [event.data.strip()]
+
+        if not paths:
+            return
+            
+        dropped_path = paths[0]
+
+        if os.path.isdir(dropped_path):
+            if not self.project_manager.current_project_path:
+                if messagebox.askyesno("Create Project?", f"Do you want to create a new project using the folder:\n\n{dropped_path}?"):
+                    self.on_new_project(image_dir=dropped_path)
             else:
-                print(f"Generation failed: {caption}")
-                self.root.after(0, lambda item_id=item_id: self.tree.set(item_id, "status", "❌"))
-            self.root.after(0, lambda i=i: self.progress_var.set((i + 1) / total * 100))
-        self.root.after(0, self.finalize_generation)
-
-    def finalize_generation(self):
-        self.generating = False
-        status = "Done!" if not self.abort_flag else "Aborted"
-        self.status_var.set(status)
-
-    def export_csv(self):
-        path = filedialog.asksaveasfilename(defaultextension=".csv", filetypes=[("CSV", "*.csv")])
-        if not path:
-            return
-        data = []
-        for d in self.selected_files.values():
-            caption = ""
-            if os.path.exists(d["txt_path"]):
-                with open(d["txt_path"], "r", encoding="utf-8") as f:
-                    caption = f.read().strip()
-            data.append({"filename": d["filename"], "caption": caption})
-        if utils.export_to_csv(data, path):
-            messagebox.showinfo("Export", "Saved to CSV")
+                self.app_context.show_info("Project Loaded", "A project is already open. Please create a new project via the File menu.")
         else:
-            messagebox.showerror("Export", "Failed to save CSV")
-
-    def open_replace_dialog(self):
-        win = tk.Toplevel(self.root)
-        win.title("Find and Replace")
-        win.geometry("400x150")
-        win.transient(self.root)
-        win.grab_set()
-
-        tk.Label(win, text="Find:").grid(row=0, column=0, padx=10, pady=10, sticky="w")
-        find_var = tk.StringVar()
-        tk.Entry(win, textvariable=find_var, width=40).grid(row=0, column=1, padx=10, pady=5)
-
-        tk.Label(win, text="Replace:").grid(row=1, column=0, padx=10, pady=5, sticky="w")
-        replace_var = tk.StringVar()
-        tk.Entry(win, textvariable=replace_var, width=40).grid(row=1, column=1, padx=10, pady=5)
-
-        def do_replace():
-            find = find_var.get()
-            replace = replace_var.get()
-            if not find:
-                return
-            items = self.tree.selection() or self.tree.get_children()
-            changed = 0
-            for item_id in items:
-                data = self.selected_files.get(item_id)
-                if data is None:
-                    continue
-                txt_path = data["txt_path"]
-                if os.path.exists(txt_path):
-                    with open(txt_path, "r", encoding="utf-8") as f:
-                        content = f.read()
-                    if find in content:
-                        new_content = content.replace(find, replace)
-                        with open(txt_path, "w", encoding="utf-8") as f:
-                            f.write(new_content)
-                        changed += 1
-                        self.root.after(0, lambda item_id=item_id: self.tree.set(item_id, "status", "✅"))
-            messagebox.showinfo("Replace", f"Updated {changed} files")
-            win.destroy()
-
-        tk.Button(win, text="Replace", command=do_replace).grid(row=2, column=1, padx=10, pady=10, sticky="e")
+            self.app_context.show_info("Drag & Drop", "Please drop a folder to create a new project.")
